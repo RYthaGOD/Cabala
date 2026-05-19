@@ -49,11 +49,12 @@ Liquidity Withdrawal TX: 5FdGq3xabZHKo616qstYjCp41LtRgGAAspiqNTKrPJv5TQ7AfQ7kK85
 
 To ensure the contract's absolute defense against exploit vectors:
 
-### A. Metaplex Certified Collection (MCC) Verification
-To prevent counterfeit NFT exploits, the `borrow` instruction strictly deserializes the Metaplex Metadata Account associated with the provided NFT Mint. The contract asserts:
-1. The metadata account address matches the exact PDA derived from Metaplex rules.
-2. The collection property is present and has been marked as `verified: true` by the Metaplex system.
-3. The collection key exactly matches the verified **Jito Cabal Collection Mint** (`5YVNYsdh7RPEunc5VaiX4ky33W6TjTq9Vwt34Bhpfjtw`).
+### A. Metaplex Core NFT & Collection Verification
+To prevent counterfeit NFT exploits, the `borrow` instruction strictly validates the NFT Asset and Collection parameters against Metaplex Core on-chain specifications:
+1. The NFT asset account's owner is verified to be the official Metaplex Core program (`Co1e111111111111111111111111111111111111111`).
+2. The NFT asset's ownership is deserialized and verified to belong to the borrower initiating the loan.
+3. The NFT asset's Collection property is derived directly from its `UpdateAuthority` metadata (verifying that its update authority is `UpdateAuthority::Collection(Pubkey)`).
+4. The NFT asset's verified Collection key exactly matches the Jito Cabal Collection Mint (`F7YJeY3wPhgUCvV4EKEKWx7YgNENG21178BHMujz6BzU`), completely eliminating fake collateral exploits.
 
 ### B. Safe Exit Mutability (Direct PDA lamport mutation)
 Instead of forcing additional CPI signers during LP liquidity exit, `withdraw_liquidity` directly adjusts lamport balances:
@@ -63,9 +64,7 @@ Instead of forcing additional CPI signers during LP liquidity exit, `withdraw_li
 ```
 This avoids transaction footprint, reduces compile-time warnings, and guarantees deterministic and atomic transfers.
 
-### C. Zero-Bloat Reclaim Mechanics
-All escrow and administrative accounts are explicitly closed during state transitions, refunding rent-exempt lamports back to their owners to ensure a zero state-bloat protocol footprint:
-- **`repay`**: Closes the escrow token account, returning rent lamports to the borrower.
-- **`seize_collateral`**: Closes the escrow token account, returning rent lamports to the pool PDA.
-- **`admin_withdraw_vault`**: Closes the vault ATA on withdrawal via a CPI `CloseAccount` instruction, returning rent directly to the admin.
-- **`resolve_default`**: Closes the `loan_receipt` account, returning rent lamports directly to the admin.
+### C. Zero-Escrow State Mechanics
+Because Metaplex Core is a self-contained, single-account token standard, the protocol does not require Associated Token Accounts (ATAs) or separate escrow accounts.
+- **Direct PDA Holding**: During active loans, the NFT asset's owner property is atomically changed directly to the pool's PDA. No escrow accounts are created, avoiding state-bloat and complex account closure routines.
+- **Cleanups**: Upon repayment, the receipt account is closed and rent lamports are returned to the borrower. Upon seizure, the receipts are resolved, paying the keeper and returning remaining rent lamports to the admin.

@@ -1,8 +1,9 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program::{transfer, Transfer};
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer as SplTransfer, CloseAccount};
-use mpl_token_metadata::accounts::Metadata;
 use std::str::FromStr;
+use mpl_core::accounts::BaseAssetV1;
+use mpl_core::types::UpdateAuthority;
+use mpl_core::instructions::TransferV1CpiBuilder;
 
 declare_id!("EazAH8Adyino7uConjZfYdjFqmjqfm7vBtTsba3Ejg39");
 
@@ -10,8 +11,8 @@ pub const LTV_AMOUNT: u64 = 1_200_000_000; // 1.2 SOL
 pub const LOAN_DURATION: i64 = 7 * 24 * 60 * 60; // 7 days in seconds
 pub const KEEPER_BOUNTY: u64 = 20_000_000; // 0.02 SOL
 
-// Real Jito Cabal Verified Collection Mint (Placeholder - update prior to prod deployment)
-pub const CABAL_COLLECTION: &str = "5YVNYsdh7RPEunc5VaiX4ky33W6TjTq9Vwt34Bhpfjtw"; 
+// Real Jito Cabal Verified Collection Mint
+pub const CABAL_COLLECTION: &str = "F7YJeY3wPhgUCvV4EKEKWx7YgNENG21178BHMujz6BzU";
 
 #[program]
 pub mod jito_cabal_lending {
@@ -82,57 +83,68 @@ pub mod jito_cabal_lending {
     }
 
     pub fn borrow(ctx: Context<Borrow>) -> Result<()> {
-        let pool = &mut ctx.accounts.global_pool;
-        let receipt = &mut ctx.accounts.loan_receipt;
         let clock = Clock::get()?;
 
-        // 1. Strict Metaplex Certified Collection (MCC) Verification
-        let metadata_info = &ctx.accounts.nft_metadata;
-        let metadata = Metadata::try_from(&metadata_info.to_account_info()).map_err(|_| ErrorCode::InvalidMetadata)?;
+        // 1. Strict Metaplex Core Verification
+        // Verify owner is Metaplex Core Program
+        require_keys_eq!(ctx.accounts.nft_asset.owner.key(), mpl_core::ID, ErrorCode::InvalidMetadata);
         
-        let collection = metadata.collection.ok_or(ErrorCode::NotPartOfCollection)?;
-        require!(collection.verified, ErrorCode::CollectionNotVerified);
+        let asset = BaseAssetV1::try_deserialize(&mut &ctx.accounts.nft_asset.try_borrow_data()?[..])?;
+        
+        // Verify current owner of the asset is the borrower
+        require_keys_eq!(asset.owner, ctx.accounts.borrower.key(), ErrorCode::InvalidOwner);
+        
+        // Verify collection link via UpdateAuthority
+        let collection_key = match asset.update_authority {
+            UpdateAuthority::Collection(key) => key,
+            _ => return err!(ErrorCode::NotPartOfCollection),
+        };
         
         let expected_collection_pubkey = Pubkey::from_str(CABAL_COLLECTION).unwrap();
-        require!(collection.key == expected_collection_pubkey, ErrorCode::InvalidCollection);
+        require_keys_eq!(collection_key, expected_collection_pubkey, ErrorCode::InvalidCollection);
+        require_keys_eq!(ctx.accounts.nft_collection.key(), expected_collection_pubkey, ErrorCode::InvalidCollection);
 
-        // 2. Rent-Exemption Safety Check
-        let rent_minimum = Rent::get()?.minimum_balance(pool.to_account_info().data_len());
-        require!(pool.total_sol >= LTV_AMOUNT, ErrorCode::InsufficientLiquidity);
-        
-        let current_lamports = pool.to_account_info().lamports();
-        require!(current_lamports.checked_sub(LTV_AMOUNT).ok_or(ErrorCode::MathOverflow)? >= rent_minimum, ErrorCode::RentExemptionRisk);
+        // 2. Rent-Exemption Safety Check & Pool SOL deductions in scoped block to avoid E0502
+        {
+            let pool = &mut ctx.accounts.global_pool;
+            let rent_minimum = Rent::get()?.minimum_balance(pool.to_account_info().data_len());
+            require!(pool.total_sol >= LTV_AMOUNT, ErrorCode::InsufficientLiquidity);
+            
+            let current_lamports = pool.to_account_info().lamports();
+            require!(current_lamports.checked_sub(LTV_AMOUNT).ok_or(ErrorCode::MathOverflow)? >= rent_minimum, ErrorCode::RentExemptionRisk);
 
-        // 3. Transfer NFT to Escrow
-        let cpi_accounts = SplTransfer {
-            from: ctx.accounts.borrower_nft_account.to_account_info(),
-            to: ctx.accounts.escrow_nft_account.to_account_info(),
-            authority: ctx.accounts.borrower.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        token::transfer(CpiContext::new(cpi_program, cpi_accounts), 1)?;
+            pool.total_sol = pool.total_sol.checked_sub(LTV_AMOUNT).ok_or(ErrorCode::MathOverflow)?;
+        }
+
+        // 3. Transfer Metaplex Core NFT directly to Pool PDA
+        TransferV1CpiBuilder::new(&ctx.accounts.mpl_core_program.to_account_info())
+            .asset(&ctx.accounts.nft_asset.to_account_info())
+            .new_owner(&ctx.accounts.global_pool.to_account_info())
+            .payer(&ctx.accounts.borrower.to_account_info())
+            .collection(Some(&ctx.accounts.nft_collection.to_account_info()))
+            .authority(Some(&ctx.accounts.borrower.to_account_info()))
+            .invoke()?;
 
         // 4. Dispense SOL
-        pool.total_sol = pool.total_sol.checked_sub(LTV_AMOUNT).ok_or(ErrorCode::MathOverflow)?;
-        **pool.to_account_info().try_borrow_mut_lamports()? -= LTV_AMOUNT;
+        **ctx.accounts.global_pool.to_account_info().try_borrow_mut_lamports()? -= LTV_AMOUNT;
         **ctx.accounts.borrower.try_borrow_mut_lamports()? += LTV_AMOUNT;
 
         // 5. Initialize Receipt
+        let receipt = &mut ctx.accounts.loan_receipt;
         receipt.borrower = ctx.accounts.borrower.key();
-        receipt.nft_mint = ctx.accounts.nft_mint.key();
+        receipt.nft_mint = ctx.accounts.nft_asset.key(); // Save the asset key as the mint reference
         receipt.start_time = clock.unix_timestamp;
         receipt.principal = LTV_AMOUNT;
         receipt.status = LoanStatus::Active;
         receipt.bump = ctx.bumps.loan_receipt;
 
-        msg!("Borrow successful. Dispensed 1.2 SOL. Fake NFT Exploit prevented.");
+        msg!("Borrow successful. Dispensed 1.2 SOL. Core NFT verified and escrowed.");
         Ok(())
     }
 
     pub fn repay(ctx: Context<Repay>) -> Result<()> {
-        let pool = &mut ctx.accounts.global_pool;
-        let receipt = &mut ctx.accounts.loan_receipt;
         let clock = Clock::get()?;
+        let receipt = &mut ctx.accounts.loan_receipt;
         
         require!(receipt.status == LoanStatus::Active, ErrorCode::InvalidLoanState);
         
@@ -153,41 +165,33 @@ pub mod jito_cabal_lending {
             ctx.accounts.system_program.to_account_info(),
             Transfer {
                 from: ctx.accounts.borrower.to_account_info(),
-                to: pool.to_account_info(),
+                to: ctx.accounts.global_pool.to_account_info(),
             },
         );
         transfer(cpi_context, total_repayment)?;
 
-        pool.total_sol = pool.total_sol.checked_add(total_repayment).ok_or(ErrorCode::MathOverflow)?;
+        // Scoped block to safely update pool total SOL before CPI
+        let global_pool_bump = {
+            let pool = &mut ctx.accounts.global_pool;
+            pool.total_sol = pool.total_sol.checked_add(total_repayment).ok_or(ErrorCode::MathOverflow)?;
+            pool.bump
+        };
 
-        // Return NFT & Close Escrow
-        let bump_bytes = pool.bump.to_le_bytes();
+        // Return Metaplex Core NFT to Borrower
+        let bump_bytes = global_pool_bump.to_le_bytes();
         let seeds = &[b"pool".as_ref(), bump_bytes.as_ref()];
         let signer = &[&seeds[..]];
 
-        let cpi_accounts = SplTransfer {
-            from: ctx.accounts.escrow_nft_account.to_account_info(),
-            to: ctx.accounts.borrower_nft_account.to_account_info(),
-            authority: pool.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer),
-            1,
-        )?;
-        
-        // Close the escrow token account to prevent bloat and refund rent
-        token::close_account(CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            token::CloseAccount {
-                account: ctx.accounts.escrow_nft_account.to_account_info(),
-                destination: ctx.accounts.borrower.to_account_info(),
-                authority: pool.to_account_info(),
-            },
-            signer,
-        ))?;
+        TransferV1CpiBuilder::new(&ctx.accounts.mpl_core_program.to_account_info())
+            .asset(&ctx.accounts.nft_asset.to_account_info())
+            .new_owner(&ctx.accounts.borrower.to_account_info())
+            .payer(&ctx.accounts.borrower.to_account_info())
+            .collection(Some(&ctx.accounts.nft_collection.to_account_info()))
+            .authority(Some(&ctx.accounts.global_pool.to_account_info()))
+            .invoke_signed(signer)?;
 
         receipt.status = LoanStatus::Repaid;
-        msg!("Repaid {} SOL. NFT Returned. APY dynamically calculated. Receipt closed.", total_repayment);
+        msg!("Repaid {} SOL. Core NFT returned to borrower.", total_repayment);
         Ok(())
     }
 
@@ -200,69 +204,24 @@ pub mod jito_cabal_lending {
         let elapsed_time = clock.unix_timestamp.checked_sub(receipt.start_time).unwrap_or(0);
         require!(elapsed_time > LOAN_DURATION, ErrorCode::LoanNotExpired);
 
-        let pool = &ctx.accounts.global_pool;
-        let bump_bytes = pool.bump.to_le_bytes();
+        let global_pool_bump = ctx.accounts.global_pool.bump;
+        let bump_bytes = global_pool_bump.to_le_bytes();
         let seeds = &[b"pool".as_ref(), bump_bytes.as_ref()];
         let signer = &[&seeds[..]];
 
-        let cpi_accounts = SplTransfer {
-            from: ctx.accounts.escrow_nft_account.to_account_info(),
-            to: ctx.accounts.admin_vault_account.to_account_info(),
-            authority: pool.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer),
-            1,
-        )?;
-
-        // Close the escrow account and send rent to pool
-        token::close_account(CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            token::CloseAccount {
-                account: ctx.accounts.escrow_nft_account.to_account_info(),
-                destination: pool.to_account_info(),
-                authority: pool.to_account_info(),
-            },
-            signer,
-        ))?;
+        // Direct-to-Wallet repossession: Transfer directly to admin's wallet
+        TransferV1CpiBuilder::new(&ctx.accounts.mpl_core_program.to_account_info())
+            .asset(&ctx.accounts.nft_asset.to_account_info())
+            .new_owner(&ctx.accounts.admin.to_account_info())
+            .payer(&ctx.accounts.keeper.to_account_info())
+            .collection(Some(&ctx.accounts.nft_collection.to_account_info()))
+            .authority(Some(&ctx.accounts.global_pool.to_account_info()))
+            .invoke_signed(signer)?;
 
         receipt.status = LoanStatus::PendingRepo;
         receipt.keeper = ctx.accounts.keeper.key(); 
 
-        msg!("Loan defaulted. NFT moved to Admin Vault. Escrow closed.");
-        Ok(())
-    }
-
-    pub fn admin_withdraw_vault(ctx: Context<AdminWithdrawVault>) -> Result<()> {
-        let pool = &ctx.accounts.global_pool;
-        
-        let bump_bytes = pool.bump.to_le_bytes();
-        let seeds = &[b"pool".as_ref(), bump_bytes.as_ref()];
-        let signer = &[&seeds[..]];
-
-        // Transfer NFT to Admin Destination
-        let cpi_accounts = SplTransfer {
-            from: ctx.accounts.admin_vault_account.to_account_info(),
-            to: ctx.accounts.admin_dest_account.to_account_info(),
-            authority: pool.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer),
-            1,
-        )?;
-
-        // Close the Admin Vault ATA to prevent state bloat and refund rent
-        token::close_account(CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            token::CloseAccount {
-                account: ctx.accounts.admin_vault_account.to_account_info(),
-                destination: ctx.accounts.admin.to_account_info(),
-                authority: pool.to_account_info(),
-            },
-            signer,
-        ))?;
-
-        msg!("Admin withdrew seized NFT and closed vault ATA.");
+        msg!("Loan defaulted. Core NFT moved directly to Admin Wallet.");
         Ok(())
     }
 
@@ -289,7 +248,7 @@ pub mod jito_cabal_lending {
         pool.total_sol = pool.total_sol.checked_add(repo_value.checked_sub(KEEPER_BOUNTY).ok_or(ErrorCode::MathOverflow)?).ok_or(ErrorCode::MathOverflow)?;
         receipt.status = LoanStatus::Resolved;
 
-        msg!("Repo Resolved. 2 SOL recovered. Receipt closed.");
+        msg!("Repo Resolved. 2 SOL recovered. Keeper bounty paid.");
         Ok(())
     }
 }
@@ -360,36 +319,35 @@ pub struct WithdrawLiquidity<'info> {
 pub struct Borrow<'info> {
     #[account(mut, seeds = [b"pool"], bump = global_pool.bump)]
     pub global_pool: Account<'info, GlobalPool>,
-    #[account(init, payer = borrower, space = 8 + 32 + 32 + 8 + 8 + 1 + 32 + 1, seeds = [b"receipt", borrower.key().as_ref(), nft_mint.key().as_ref()], bump)]
+    #[account(init, payer = borrower, space = 8 + 32 + 32 + 8 + 8 + 1 + 32 + 1, seeds = [b"receipt", borrower.key().as_ref(), nft_asset.key().as_ref()], bump)]
     pub loan_receipt: Box<Account<'info, LoanReceipt>>,
     #[account(mut)]
     pub borrower: Signer<'info>,
-    pub nft_mint: Account<'info, Mint>,
-    #[account(mut, constraint = borrower_nft_account.mint == nft_mint.key() && borrower_nft_account.owner == borrower.key())]
-    pub borrower_nft_account: Box<Account<'info, TokenAccount>>,
-    /// CHECK: Metaplex Metadata Account
-    pub nft_metadata: UncheckedAccount<'info>,
-    #[account(init, payer = borrower, token::mint = nft_mint, token::authority = global_pool, seeds = [b"escrow", nft_mint.key().as_ref()], bump)]
-    pub escrow_nft_account: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    /// CHECK: Metaplex Core Asset Account
+    #[account(mut)]
+    pub nft_asset: AccountInfo<'info>,
+    /// CHECK: Metaplex Core Collection Account
+    pub nft_collection: AccountInfo<'info>,
+    /// CHECK: Metaplex Core Program
+    pub mpl_core_program: AccountInfo<'info>,
     pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
 pub struct Repay<'info> {
     #[account(mut, seeds = [b"pool"], bump = global_pool.bump)]
     pub global_pool: Account<'info, GlobalPool>,
-    // Closes the loan receipt to prevent state bloat and refund rent
-    #[account(mut, close = borrower, constraint = loan_receipt.borrower == borrower.key())]
+    #[account(mut, close = borrower, constraint = loan_receipt.borrower == borrower.key() && loan_receipt.nft_mint == nft_asset.key())]
     pub loan_receipt: Box<Account<'info, LoanReceipt>>,
     #[account(mut)]
     pub borrower: Signer<'info>,
+    /// CHECK: Metaplex Core Asset Account
     #[account(mut)]
-    pub escrow_nft_account: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub borrower_nft_account: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
+    pub nft_asset: AccountInfo<'info>,
+    /// CHECK: Metaplex Core Collection Account
+    pub nft_collection: AccountInfo<'info>,
+    /// CHECK: Metaplex Core Program
+    pub mpl_core_program: AccountInfo<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -397,37 +355,27 @@ pub struct Repay<'info> {
 pub struct SeizeCollateral<'info> {
     #[account(mut, seeds = [b"pool"], bump = global_pool.bump)]
     pub global_pool: Account<'info, GlobalPool>,
-    #[account(mut)]
+    #[account(mut, constraint = loan_receipt.nft_mint == nft_asset.key())]
     pub loan_receipt: Account<'info, LoanReceipt>,
     #[account(mut)]
     pub keeper: Signer<'info>,
+    /// CHECK: Metaplex Core Asset Account
     #[account(mut)]
-    pub escrow_nft_account: Account<'info, TokenAccount>,
-    // Strict constraints: Mint matches the seized NFT, authority is the Pool PDA
-    #[account(mut, constraint = admin_vault_account.mint == loan_receipt.nft_mint && admin_vault_account.owner == global_pool.key())]
-    pub admin_vault_account: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct AdminWithdrawVault<'info> {
-    #[account(mut, seeds = [b"pool"], bump = global_pool.bump, has_one = admin)]
-    pub global_pool: Account<'info, GlobalPool>,
-    #[account(mut)]
-    pub admin: Signer<'info>,
-    // Strict constraints: Mint matches Admin destination, authority is the Pool PDA
-    #[account(mut, constraint = admin_vault_account.mint == admin_dest_account.mint && admin_vault_account.owner == global_pool.key())]
-    pub admin_vault_account: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub admin_dest_account: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
+    pub nft_asset: AccountInfo<'info>,
+    /// CHECK: Metaplex Core Collection Account
+    pub nft_collection: AccountInfo<'info>,
+    /// CHECK: Metaplex Core Program
+    pub mpl_core_program: AccountInfo<'info>,
+    /// CHECK: Admin recipient wallet
+    #[account(mut, address = global_pool.admin)]
+    pub admin: AccountInfo<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct ResolveDefault<'info> {
     #[account(mut, seeds = [b"pool"], bump = global_pool.bump)]
     pub global_pool: Account<'info, GlobalPool>,
-    // Closes the loan receipt to refund rent to the admin upon resolution
     #[account(mut, close = admin)]
     pub loan_receipt: Account<'info, LoanReceipt>,
     #[account(mut, constraint = global_pool.admin == admin.key())]
@@ -460,4 +408,6 @@ pub enum ErrorCode {
     RentExemptionRisk,
     #[msg("Lender has requested to withdraw more shares than they own.")]
     InsufficientShares,
+    #[msg("Borrower is not the owner of the NFT.")]
+    InvalidOwner,
 }

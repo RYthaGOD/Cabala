@@ -3,8 +3,7 @@
 import { useState, useCallback, useMemo } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { Program, AnchorProvider, BN, Idl } from "@coral-xyz/anchor";
-import { PublicKey, SystemProgram, SYSVAR_RENT_PUBKEY } from "@solana/web3.js";
-import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { PublicKey, SystemProgram } from "@solana/web3.js";
 import idl from "../idl.json";
 
 export function useLending() {
@@ -23,7 +22,7 @@ export function useLending() {
 
   const program = useMemo(() => {
     if (!provider) return null;
-    return new Program(idl as Idl, provider);
+    return new Program(idl as any, provider);
   }, [provider]);
 
   const depositLiquidity = useCallback(
@@ -55,11 +54,13 @@ export function useLending() {
   );
 
   const borrow = useCallback(
-    async (nftMintStr: string) => {
+    async (nftAssetStr: string, nftCollectionStr: string) => {
       if (!program || !wallet.publicKey) throw new Error("Wallet not connected");
       setLoading(true);
       try {
-        const nftMint = new PublicKey(nftMintStr);
+        const nftAsset = new PublicKey(nftAssetStr);
+        const nftCollection = new PublicKey(nftCollectionStr);
+        
         const [globalPool] = PublicKey.findProgramAddressSync(
           [Buffer.from("pool")],
           program.programId
@@ -69,29 +70,9 @@ export function useLending() {
           [
             Buffer.from("receipt"),
             wallet.publicKey.toBuffer(),
-            nftMint.toBuffer(),
+            nftAsset.toBuffer(),
           ],
           program.programId
-        );
-
-        const [escrowNftAccount] = PublicKey.findProgramAddressSync(
-          [Buffer.from("escrow"), nftMint.toBuffer()],
-          program.programId
-        );
-
-        const borrowerNftAccount = getAssociatedTokenAddressSync(
-          nftMint,
-          wallet.publicKey
-        );
-
-        // Derive Metaplex Metadata Account PDA
-        const [nftMetadata] = PublicKey.findProgramAddressSync(
-          [
-            Buffer.from("metadata"),
-            new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s").toBuffer(),
-            nftMint.toBuffer(),
-          ],
-          new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s")
         );
 
         const tx = await program.methods
@@ -100,13 +81,10 @@ export function useLending() {
             globalPool,
             loanReceipt,
             borrower: wallet.publicKey,
-            nftMint,
-            borrowerNftAccount,
-            nftMetadata,
-            escrowNftAccount,
-            tokenProgram: TOKEN_PROGRAM_ID,
+            nftAsset,
+            nftCollection,
+            mplCoreProgram: new PublicKey("Co1e111111111111111111111111111111111111111"),
             systemProgram: SystemProgram.programId,
-            rent: SYSVAR_RENT_PUBKEY,
           })
           .rpc();
 
@@ -119,11 +97,13 @@ export function useLending() {
   );
 
   const repay = useCallback(
-    async (nftMintStr: string) => {
+    async (nftAssetStr: string, nftCollectionStr: string) => {
       if (!program || !wallet.publicKey) throw new Error("Wallet not connected");
       setLoading(true);
       try {
-        const nftMint = new PublicKey(nftMintStr);
+        const nftAsset = new PublicKey(nftAssetStr);
+        const nftCollection = new PublicKey(nftCollectionStr);
+
         const [globalPool] = PublicKey.findProgramAddressSync(
           [Buffer.from("pool")],
           program.programId
@@ -133,19 +113,9 @@ export function useLending() {
           [
             Buffer.from("receipt"),
             wallet.publicKey.toBuffer(),
-            nftMint.toBuffer(),
+            nftAsset.toBuffer(),
           ],
           program.programId
-        );
-
-        const [escrowNftAccount] = PublicKey.findProgramAddressSync(
-          [Buffer.from("escrow"), nftMint.toBuffer()],
-          program.programId
-        );
-
-        const borrowerNftAccount = getAssociatedTokenAddressSync(
-          nftMint,
-          wallet.publicKey
         );
 
         const tx = await program.methods
@@ -154,9 +124,9 @@ export function useLending() {
             globalPool,
             loanReceipt,
             borrower: wallet.publicKey,
-            escrowNftAccount,
-            borrowerNftAccount,
-            tokenProgram: TOKEN_PROGRAM_ID,
+            nftAsset,
+            nftCollection,
+            mplCoreProgram: new PublicKey("Co1e111111111111111111111111111111111111111"),
             systemProgram: SystemProgram.programId,
           })
           .rpc();
