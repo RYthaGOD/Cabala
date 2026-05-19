@@ -5,24 +5,62 @@ import { motion, AnimatePresence } from "framer-motion";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { useWallet } from "@solana/wallet-adapter-react";
 import { ArrowRightLeft, ShieldAlert, Zap, Lock, Search } from "lucide-react";
+import { useLending } from "../hooks/useLending";
 
 export default function Dashboard() {
   const { publicKey, connected } = useWallet();
+  const { borrow, depositLiquidity, repay, loading: txLoading } = useLending();
+  
   const [isScanning, setIsScanning] = useState(false);
   const [hasNft, setHasNft] = useState<boolean | null>(null);
+  const [depositAmount, setDepositAmount] = useState<string>("");
+  const [txSignature, setTxSignature] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  // Mock NFT Mint for demo execution
+  const demoNftMint = "5YVNYsdh7RPEunc5VaiX4ky33W6TjTq9Vwt34Bhpfjtw";
 
   useEffect(() => {
     if (connected && publicKey) {
       setIsScanning(true);
+      setErrorMsg(null);
+      setTxSignature(null);
       const timer = setTimeout(() => {
         setIsScanning(false);
-        setHasNft(true); // Mock verification
+        setHasNft(true); // Mock verification for UI
       }, 1500);
       return () => clearTimeout(timer);
     } else {
       setHasNft(null);
+      setTxSignature(null);
+      setErrorMsg(null);
     }
   }, [connected, publicKey]);
+
+  const handleDeposit = async () => {
+    if (!depositAmount || isNaN(parseFloat(depositAmount))) return;
+    setErrorMsg(null);
+    setTxSignature(null);
+    try {
+      const tx = await depositLiquidity(parseFloat(depositAmount));
+      if (tx) setTxSignature(tx);
+    } catch (err: any) {
+      console.error(err);
+      setErrorMsg(err.message || "Transaction failed.");
+    }
+  };
+
+  const handleBorrow = async () => {
+    setErrorMsg(null);
+    setTxSignature(null);
+    try {
+      const tx = await borrow(demoNftMint);
+      if (tx) setTxSignature(tx);
+    } catch (err: any) {
+      console.error(err);
+      setErrorMsg(err.message || "Transaction failed.");
+    }
+  };
 
   return (
     <main className="min-h-screen p-8 max-w-6xl mx-auto flex flex-col gap-12">
@@ -40,6 +78,27 @@ export default function Dashboard() {
         </div>
         <WalletMultiButton className="!bg-zinc-800 hover:!bg-zinc-700 !rounded-xl !h-10 !px-4 !font-medium transition-colors border border-zinc-700" />
       </motion.header>
+
+      {/* Transaction Notifications */}
+      {txSignature && (
+        <motion.div 
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-xl text-emerald-400 text-sm font-mono text-center break-all"
+        >
+          Transaction Success! Signature: <a href={`https://explorer.solana.com/tx/${txSignature}?cluster=devnet`} target="_blank" rel="noopener noreferrer" className="underline font-bold">{txSignature}</a>
+        </motion.div>
+      )}
+
+      {errorMsg && (
+        <motion.div 
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400 text-sm text-center"
+        >
+          {errorMsg}
+        </motion.div>
+      )}
 
       {/* Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 relative">
@@ -83,8 +142,12 @@ export default function Dashboard() {
             </div>
           </div>
 
-          <button disabled={!hasNft} className="relative z-10 w-full h-14 rounded-xl bg-cyan-500 text-zinc-950 font-bold text-lg hover:bg-cyan-400 transition-all active:scale-[0.98] shadow-[0_0_20px_rgba(0,240,255,0.3)] disabled:opacity-50 disabled:shadow-none disabled:hover:bg-cyan-500 disabled:cursor-not-allowed">
-            Borrow 1.2 SOL
+          <button 
+            onClick={handleBorrow}
+            disabled={!hasNft || txLoading} 
+            className="relative z-10 w-full h-14 rounded-xl bg-cyan-500 text-zinc-950 font-bold text-lg hover:bg-cyan-400 transition-all active:scale-[0.98] shadow-[0_0_20px_rgba(0,240,255,0.3)] disabled:opacity-50 disabled:shadow-none disabled:hover:bg-cyan-500 disabled:cursor-not-allowed"
+          >
+            {txLoading ? "Approving Transaction..." : "Borrow 1.2 SOL"}
           </button>
 
           {/* Access Overlay */}
@@ -153,11 +216,17 @@ export default function Dashboard() {
           <div className="flex gap-3 relative z-10">
             <input 
               type="number" 
+              value={depositAmount}
+              onChange={(e) => setDepositAmount(e.target.value)}
               placeholder="Amount in SOL" 
               className="flex-1 bg-zinc-950/50 border border-zinc-800 rounded-xl px-4 text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-amber-500/50 focus:ring-1 focus:ring-amber-500/50 transition-all"
             />
-            <button className="w-32 h-14 rounded-xl bg-amber-500 text-zinc-950 font-bold hover:bg-amber-400 transition-all active:scale-[0.98]">
-              Deposit
+            <button 
+              onClick={handleDeposit}
+              disabled={txLoading}
+              className="w-32 h-14 rounded-xl bg-amber-500 text-zinc-950 font-bold hover:bg-amber-400 transition-all active:scale-[0.98] disabled:opacity-50"
+            >
+              {txLoading ? "Depositing..." : "Deposit"}
             </button>
           </div>
           
